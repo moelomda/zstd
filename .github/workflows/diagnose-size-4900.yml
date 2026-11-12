@@ -1,0 +1,132 @@
+name: Diagnose zstd size for issue 4900
+
+on:
+  push:
+    branches: [codex/diagnose-size-4900]
+
+permissions:
+  contents: read
+
+jobs:
+  compare-size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASE_SHA: 274401141766d791a0ab21a5e7472290bb95f2cb
+      CANDIDATE_SHA: 803b0aa45eb5cc8163eefe24fb5fb314e2fe93db
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          ref: 803b0aa45eb5cc8163eefe24fb5fb314e2fe93db
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Measure both revisions against the unchanged size limits
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          # Diagnostic only: this does not replace or modify libzstd-size.
+          results = Path(os.environ["RUNNER_TEMP"]) / "zstd-size-4900-results"
+          results.mkdir()
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          scratch = Path(tempfile.mkdtemp(prefix="zstd-size-4900-", dir=os.environ["RUNNER_TEMP"]))
+          revisions = [("baseline", os.environ["BASE_SHA"]), ("candidate", os.environ["CANDIDATE_SHA"])]
+          configurations = [
+              ("normal", 1100000, []),
+              ("decompress", 400000, ["ZSTD_LIB_COMPRESSION=0", "ZSTD_LIB_DICTBUILDER=0"]),
+              ("minify", 300000, ["ZSTD_LIB_MINIFY=1"]),
+              ("minify-decompress", 80000, ["ZSTD_LIB_MINIFY=1", "ZSTD_LIB_COMPRESSION=0", "ZSTD_LIB_DICTBUILDER=0"]),
+          ]
+          metadata = {"revisions": dict(revisions), "runner_image": os.environ.get("ImageOS"),
+                      "runner_image_version": os.environ.get("ImageVersion"),
+                      "environment": {k: os.environ.get(k) for k in
+                                      ("CC", "CFLAGS", "CPPFLAGS", "LDFLAGS", "MAKEFLAGS")}}
+          (results / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          with (results / "environment.log").open("w") as log:
+              log.write(Path("/etc/os-release").read_text())
+              log.flush()
+              for command in (["uname", "-a"], ["cc", "--version"], ["cc", "-v"],
+                              ["ld", "--version"], ["make", "--version"], ["python3", "--version"]):
+                  log.write("$ " + " ".join(command) + "\n")
+                  log.flush()
+                  subprocess.run(command, cwd=workspace, stdout=log, stderr=subprocess.STDOUT, check=True)
+          trees = {}
+          for arm, sha in revisions:
+              actual = subprocess.check_output(["git", "rev-parse", sha + "^{commit}"],
+                                               cwd=workspace, text=True).strip()
+              if actual != sha:
+                  raise RuntimeError("Pinned revision mismatch: " + arm)
+              archive = scratch / (arm + ".tar")
+              tree = scratch / arm
+              tree.mkdir()
+              with archive.open("wb") as output:
+                  subprocess.run(["git", "archive", "--format=tar", sha],
+                                 cwd=workspace, stdout=output, check=True)
+              subprocess.run(["tar", "-xf", str(archive), "-C", str(tree)], check=True)
+              trees[arm] = tree
+
+          records = []
+          build_failed = False
+          threshold_failed = False
+          for name, limit, flags in configurations:
+              for arm, sha in revisions:
+                  tree = trees[arm]
+                  row = {"configuration": name, "arm": arm, "sha": sha, "limit_bytes": limit,
+                         "flags": flags, "build_command": ["make", "-j2", "-C", "lib", "libzstd"] + flags,
+                         "clean_status": None, "build_status": None, "bytes": None, "check_size_status": None}
+                  with (results / (name + "-" + arm + "-build.log")).open("w") as log:
+                      clean = subprocess.run(["make", "clean"], cwd=tree, stdout=log, stderr=subprocess.STDOUT)
+                      row["clean_status"] = clean.returncode
+                      if clean.returncode == 0:
+                          build = subprocess.run(row["build_command"], cwd=tree, stdout=log, stderr=subprocess.STDOUT)
+                          row["build_status"] = build.returncode
+                  library = tree / "lib/libzstd.so"
+                  if row["clean_status"] != 0 or row["build_status"] != 0 or not library.is_file():
+                      row["outcome"] = "build_failed"
+                      build_failed = True
+                  else:
+                      row["bytes"] = library.stat().st_size
+                      row["library_sha256"] = hashlib.sha256(library.read_bytes()).hexdigest()
+                      with (results / (name + "-" + arm + "-check-size.log")).open("w") as log:
+                          check = subprocess.run(["./tests/check_size.py", "lib/libzstd.so", str(limit)],
+                                                 cwd=tree, stdout=log, stderr=subprocess.STDOUT)
+                      row["check_size_status"] = check.returncode
+                      if check.returncode == 0 and row["bytes"] <= limit:
+                          row["outcome"] = "within_limit"
+                      elif check.returncode == 1 and row["bytes"] > limit:
+                          row["outcome"] = "threshold_failed"
+                          threshold_failed = True
+                      else:
+                          row["outcome"] = "size_check_failed"
+                          build_failed = True
+                  records.append(row)
+                  (results / "measurements.json").write_text(json.dumps(records, indent=2) + "\n")
+                  print(json.dumps(row), flush=True)
+
+          summary = ["Diagnostic only; existing CI gates and limits are unchanged.", "",
+                     "| Configuration | Revision | Bytes | Limit | Build exit | Size-check exit | Outcome |",
+                     "| --- | --- | ---: | ---: | ---: | ---: | --- |"]
+          for row in records:
+              summary.append("| {configuration} | {arm} | {bytes} | {limit_bytes} | {build_status} | {check_size_status} | {outcome} |".format(**row))
+          summary += ["", "All eight measurements were attempted. Build/check errors fail with exit 2; size-limit exceedances fail with exit 1."]
+          text = "\n".join(summary) + "\n"
+          (results / "summary.md").write_text(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(text)
+          sys.exit(2 if build_failed else 1 if threshold_failed else 0)
+          PY
+      - name: Preserve diagnostics even when builds or thresholds fail
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # tag=v7.0.2
+        with:
+          name: zstd-size-4900-diagnostic
+          path: ${{ runner.temp }}/zstd-size-4900-results/
+          if-no-files-found: error
+          retention-days: 7
