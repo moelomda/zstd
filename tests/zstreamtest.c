@@ -722,6 +722,70 @@ static int basicUnitTests(U32 seed, double compressibility, int bigTests)
     }
     DISPLAYLEVEL(3, "OK \n");
 
+    DISPLAYLEVEL(3, "test%3i : empty compressed blocks : ", testNb++);
+    {   /* A compressed block needs literal and sequence headers, even for empty output. */
+        static const struct {
+            BYTE frame[16];
+            size_t size;
+            int invalid;
+        } cases[] = {
+            /* Zero-byte compressed payload: unknown size, known size, and non-last block. */
+            { { 0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x00, 0x05, 0x00, 0x00,
+                0x99, 0xe9, 0xd8, 0x51 }, 13, 1 },
+            { { 0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x00, 0x05, 0x00, 0x00,
+                0x99, 0xe9, 0xd8, 0x51 }, 13, 1 },
+            { { 0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x00, 0x04, 0x00, 0x00,
+                0x01, 0x00, 0x00, 0x99, 0xe9, 0xd8, 0x51 }, 16, 1 },
+            /* Empty raw blocks, with and without a checksum. */
+            { { 0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x00, 0x01, 0x00, 0x00,
+                0x99, 0xe9, 0xd8, 0x51 }, 13, 0 },
+            { { 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x01, 0x00, 0x00 }, 9, 0 },
+            /* Valid compressed blocks with zero literals and zero sequences. */
+            { { 0x28, 0xb5, 0x2f, 0xfd, 0x80, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x15, 0x00, 0x00, 0x00, 0x00 }, 15, 0 },
+            { { 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x15, 0x00, 0x00,
+                0x00, 0x00 }, 11, 0 }
+        };
+        size_t i;
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            size_t const oneShot = ZSTD_decompress(decodedBuffer, decodedBufferSize,
+                                                 cases[i].frame, cases[i].size);
+            size_t chunk;
+            if (cases[i].invalid) {
+                CHECK(ZSTD_getErrorCode(oneShot) != ZSTD_error_corruption_detected,
+                      "One-shot decoding accepted malformed compressed block");
+            } else {
+                CHECK(ZSTD_isError(oneShot), "Valid empty frame %u: %s",
+                      (unsigned)i, ZSTD_getErrorName(oneShot));
+                CHECK(oneShot != 0, "Expected empty output");
+            }
+            /* Exercise both fragmented input and the single-pass optimization. */
+            for (chunk = 1; chunk <= cases[i].size; chunk += cases[i].size - 1) {
+                ZSTD_inBuffer input = { cases[i].frame, 0, 0 };
+                ZSTD_outBuffer output = { decodedBuffer, decodedBufferSize, 0 };
+                size_t result = 1;
+                CHECK_Z(ZSTD_initDStream(zd));
+                while (input.pos < cases[i].size && result != 0 && !ZSTD_isError(result)) {
+                    size_t const before = input.pos;
+                    input.size = MIN(input.pos + chunk, cases[i].size);
+                    result = ZSTD_decompressStream(zd, &output, &input);
+                    CHECK(!ZSTD_isError(result) && input.pos == before,
+                          "Empty block decoder made no progress");
+                }
+                if (cases[i].invalid) {
+                    CHECK(ZSTD_getErrorCode(result) != ZSTD_error_corruption_detected,
+                          "Streaming decoding accepted malformed compressed block (case %u, chunk %u)",
+                          (unsigned)i, (unsigned)chunk);
+                } else {
+                    CHECK_Z(result);
+                    CHECK(result != 0 || input.pos != cases[i].size || output.pos != 0,
+                          "Valid empty frame did not finish correctly");
+                }
+            }
+        }
+    }
+    DISPLAYLEVEL(3, "OK \n");
+
     DISPLAYLEVEL(3, "test%3i : maxBlockSize = 2KB : ", testNb++);
     {
         ZSTD_DCtx* dctx = ZSTD_createDCtx();
